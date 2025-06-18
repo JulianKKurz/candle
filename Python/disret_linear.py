@@ -34,21 +34,21 @@ fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
 fig.suptitle("Vergleich: Diskrete Frames, Interpolation und IIR-gefiltertes Signal", fontsize=14)
 
 # 1. Diskrete Frame-Werte
-axs[0].step(time_points, signal_points, where='post')
+axs[0].step(time_points, signal_points, where='post', color='red')
 axs[0].set_title("Gegebene Frame-Pixelwerte (25 fps, diskret)")
 axs[0].set_ylabel("Pixelwert (0–255)")
 axs[0].set_ylim(min(signal_points) - 5, max(signal_points) + 5)
 axs[0].grid(True)
 
 # 2. Linear interpoliert
-axs[1].plot(time_fine, interpolated_signal)
+axs[1].plot(time_fine, interpolated_signal, color='green')
 axs[1].set_title("Linear interpoliertes Bildsignal (1000 fps)")
 axs[1].set_ylabel("Pixelwert (0–255)")
 axs[1].set_ylim(min(signal_points) - 5, max(signal_points) + 5)
 axs[1].grid(True)
 
 # 3. IIR-gefiltert
-axs[2].plot(time_fine, filtered_signal, color='orange')
+axs[2].plot(time_fine, filtered_signal, color='blue')
 axs[2].set_title("IIR-gefiltertes Signal (α = 0.99)")
 axs[2].set_xlabel("Zeit (s)")
 axs[2].set_ylabel("Pixelwert (0–255)")
