@@ -1,0 +1,555 @@
+classdef LightSourceConverter
+    methods(Static)
+        function export_candle_data(ch, name, fps, minVal, maxVal, fadeFrames)
+            % Exportiert eine Candle‑Light‑Definition als C‑Quelle mit gemeinsamer
+            % ch[]‑Zugriffs­struktur.
+            %
+            %   export_candle_data({ch0 ch1 ch2 ch3}, 'Candle', 25, 48, 197);
+            %   export_candle_data({ch0 ch1 ch2 ch3}, 'Candle', 25, 48, 197, 100);
+            %
+            %  • ch         Zell‑Array (4×) mit gleich langen uint8‑Vektoren
+            %  • name       Anzeigename / Bezeichner
+            %  • fps        Wieder­gabe­rate
+            %  • minVal     Minimaler Intensitäts­wert
+            %  • maxVal     Maximaler Intensitäts­wert
+            %  • fadeFrames (optional) Cross‑Fade‑Länge; Default: round(3*fps)
+
+            %–––– Validierung ––––––––––––––––––––––––––––––––––––––––––––––––––
+            assert(numel(ch) == 4,  'Genau 4 Kanal‑Arrays übergeben');
+            len = numel(ch{1});
+            assert(all(cellfun(@numel, ch) == len), ...
+                'Alle Kanäle müssen gleich lang sein');
+
+            %–––– Default für fadeFrames –––––––––––––––––––––––––––––––––––––––
+            if nargin < 6 || isempty(fadeFrames)
+                fadeFrames = round(3 * fps);
+            end
+
+            %–––– Programmnamen normieren –––––––––––––––––––––––––––––––––––––
+            if isstring(name), name = char(name); end
+            progname = lower(regexprep(name, '[^a-zA-Z0-9_]', '_'));
+
+            %–––– Datei wählen ––––––––––––––––––––––––––––––––––––––––––––––––
+            [fn, fp] = uiputfile('*.c', 'Speichern unter', [progname '.c']);
+            if isequal(fn, 0), disp('Abgebrochen'); return; end
+            fid = fopen(fullfile(fp, fn), 'w');
+            if fid == -1, error('Kann Datei nicht öffnen'); end
+
+            %–––– Header ––––––––––––––––––––––––––––––––––––––––––––––––––––––
+            fprintf(fid, '#include "light_programs.h"\n\n');
+
+            %–––– Kanal‑Arrays ––––––––––––––––––––––––––––––––––––––––––––––––
+            for k = 1:4
+                fprintf(fid, 'static const uint8_t ch%d[%d] = {\n    ', k-1, len);
+                data = round(ch{k});
+                for i = 1:len
+                    fprintf(fid, '%3d', data(i));
+                    if i < len, fprintf(fid, ','); end
+                    if mod(i, 12) == 0 && i < len, fprintf(fid, '\n    '); end
+                end
+                fprintf(fid, '\n};\n\n');
+            end
+
+            %–––– LightChannels Struktur ––––––––––––––––––––––––––––––––––––––
+            fprintf(fid, 'static const LightChannels data = {\n');
+            fprintf(fid, '    .ch = { ch0, ch1, ch2, ch3 }\n');
+            fprintf(fid, '};\n\n');
+
+            %–––– LightProgram Struktur –––––––––––––––––––––––––––––––––––––––
+            fprintf(fid, 'const LightProgram %s = {\n', progname);
+            fprintf(fid, '    .name         = "%s",\n', name);
+            fprintf(fid, '    .length       = %d,\n', len);
+            fprintf(fid, '    .fps          = %d,\n', fps);
+            fprintf(fid, '    .min_value    = %d,\n', round(minVal));
+            fprintf(fid, '    .max_value    = %d,\n', round(maxVal));
+            fprintf(fid, '    .fade_frames  = %d,\n', fadeFrames);   % <-- NEU
+            fprintf(fid, '    .data         = &data\n');
+            fprintf(fid, '};\n');
+
+            %–––– Fertig ––––––––––––––––––––––––––––––––––––––––––––––––––––––
+            fclose(fid);
+            fprintf('✓ Datei erfolgreich gespeichert: %s\n', fullfile(fp, fn));
+        end
+
+
+        function light_source_video = extract_light_source(video)
+
+            %% --- Parameter & Vorbereitung ------------------------------------------------
+            radius_tolerance_percent = 1;
+            FrameRate = video.FrameRate;
+            fprintf('[Info] Video geladen (%.3f fps, %d × %d)\n', ...
+                FrameRate, video.Width, video.Height);
+
+            %% --- Graustufen --------------------------------------------------------------
+            fprintf('[Info] Konvertiere zu Graustufen …\n');
+            gray_video = GrayVideoConverter.apply_gray_converter(video);
+            disp('[OK] Graustufen-Video erstellt.');
+
+            % Graustufen-Video zuschneiden basierend auf max-Bild
+            %gray_video = GrayVideoConverter.apply_gray_cropp_max(gray_video, 20, 50);
+
+            % Ersten Frame anzeigen (nach dem Cropping)
+            if ~isempty(gray_video)
+                figure('Name','Erster Frame nach Cropping');
+                imshow(gray_video(1).gray);
+                title('Erster Frame (cropped)');
+            else
+                warning('Zugeschnittenes Video ist leer – keine sichtbaren Inhalte über dem Schwellwert.');
+            end
+
+            %% --- Skalieren (erste Optimierung) ------------------------------------------
+            fprintf('[Info] Suche optimales frame_interval & scaler …\n');
+            scaled_video = GrayVideoConverter.scaleGrayVideo(gray_video, FrameRate);
+            disp('[OK] Graustufen-Video erfolgreich skaliert.');
+
+            %% --- Parameteroptimierung (Window & Blur) -----------------------------------
+            [window, blur] = GrayVideoAnalyzer.optimize_parameters(scaled_video);
+            fprintf('[Info] Optimale Parameter: window = %d, blur = %d\n', window, blur);
+
+            %% --- Moving Average & Blur ---------------------------------------------------
+            disp('[Info] Wende Moving Average & Blur an …');
+            moving_average_video = GrayVideoConverter.apply_moving_average(scaled_video, window);
+            blur_video           = GrayVideoConverter.apply_blur(moving_average_video, blur);
+            disp('[OK] Blur-Video erstellt.');
+
+            %% --- Hellste Koordinaten & Radius -------------------------------------------
+            brightest_coords = GrayVideoAnalyzer.get_brightest_coord(blur_video);
+            radius = GrayVideoAnalyzer.calculate_radius(scaled_video, brightest_coords, ...
+                video.Height, video.Width, radius_tolerance_percent);
+            fprintf('[Info] Hellste Koordinate(n) gefunden, Radius = %d Pixel\n', radius);
+
+            %% --- Erneute Moving-Average / Blur am Original ------------------------------
+            disp('[Info] Zweite Moving-Average/Blur-Runde (Original) …');
+            moving_average_video = GrayVideoConverter.apply_moving_average(gray_video, window);
+            blur_video           = GrayVideoConverter.apply_blur(moving_average_video, blur);
+            brightest_coords     = GrayVideoAnalyzer.get_brightest_coord(blur_video);
+
+            %% --- Zuschnittkoordinaten ----------------------------------------------------
+            bottom = min(brightest_coords(:,1)) - radius;
+            top    = max(brightest_coords(:,1)) + radius;
+            left   = min(brightest_coords(:,2)) - radius;
+            right  = max(brightest_coords(:,2)) + radius;
+            fprintf('[Info] ROI-Grenzen: left=%d, right=%d, top=%d, bottom=%d\n', left, right, top, bottom);
+
+            %% --- Linearisiertes Grauvideo & Crop ----------------------------------------
+            disp('[Info] Linearisiere & croppe …');
+            lin_gray_video      = GrayVideoConverter.apply_linearized_gray_converter(video);
+            lin_cropped_video   = GrayVideoConverter.crop_video(lin_gray_video, left, right, top, bottom);
+            cropped_video       = GrayVideoConverter.crop_video(gray_video,      left, right, top, bottom);
+            disp('[OK] Crop abgeschlossen.');
+
+            %% --- Blur-abhängige Weiterverarbeitung --------------------------------------
+            if blur > 1
+                disp('[Info] Blur > 1, nutze cut_out_square …');
+                moving_average_video = GrayVideoConverter.apply_moving_average(cropped_video, window);
+                blur_video           = GrayVideoConverter.apply_blur(moving_average_video, blur);
+                brightest_coords     = GrayVideoAnalyzer.get_brightest_coord(blur_video);
+
+                light_source_video   = GrayVideoConverter.cut_out_square(lin_cropped_video, brightest_coords, radius);
+                disp('[OK] Flammenquelle mit cut_out_square extrahiert.');
+            else
+                disp('[Info] Blur <= 1, alternative Pipeline …');
+                % -- (Schritte wie in deinem Original, unverändert – nur disp-Ausgaben) --
+                scaled_video = GrayVideoConverter.scaleGrayVideo(cropped_video, FrameRate);
+                [window, blur] = GrayVideoAnalyzer.optimize_parameters(scaled_video);
+                fprintf('    -> Neu optimiert: window = %d, blur = %d\n', window, blur);
+
+                moving_average_video = GrayVideoConverter.apply_moving_average(cropped_video, window);
+                blur_video           = GrayVideoConverter.apply_blur(moving_average_video, blur);
+                brightest_coords     = GrayVideoAnalyzer.get_brightest_coord(blur_video);
+                threshold_video      = GrayVideoConverter.apply_threshold(blur_video);
+                roi_video            = BinaryVideoProcessing.extract_area(threshold_video, brightest_coords);
+
+                cut_out_video = GrayVideoConverter.cut_out(roi_video, cropped_video);
+                disp('[Info] ROI extrahiert, beginne Feincrop/Rotation …');
+
+                scaled_video = GrayVideoConverter.scaleGrayVideo(cut_out_video, FrameRate);
+                [window, blur] = GrayVideoAnalyzer.optimize_parameters(scaled_video);
+                fprintf('    -> Final window = %d, blur = %d\n', window, blur);
+
+                moving_average_video = GrayVideoConverter.apply_moving_average(cut_out_video, window);
+                blur_video           = GrayVideoConverter.apply_blur(moving_average_video, blur);
+                filtered_roi_video   = GrayVideoConverter.apply_threshold(blur_video);
+
+                angle_rad = LightSourceTracker.process_and_rotate_video(filtered_roi_video, FrameRate);
+                fprintf('[Info] Rotationswinkel (rad) = %.4f\n', angle_rad);
+
+                filtered_roi_video   = GrayVideoConverter.rotate_video(filtered_roi_video, angle_rad);
+                filtered_roi_video   = GrayVideoConverter.apply_threshold(filtered_roi_video);
+                lin_cropped_video    = GrayVideoConverter.rotate_video(lin_cropped_video, angle_rad);
+
+                scaled_video         = GrayVideoConverter.scaleGrayVideo(filtered_roi_video, FrameRate);
+
+                values = [];
+                for line = 1:10
+                    bottom_line_video = BinaryVideoProcessing.erase_bottom_line(scaled_video, line);
+                    white_count       = BinaryVideoProcessing.count_bottom_white_pixels(bottom_line_video);
+                    values(end+1)     = mean(abs(diff(white_count))); %#ok<AGROW>
+                end
+                [~, line_idx] = min(values);
+                fprintf('[Info] Optimale Bottom-Line = %d\n', line_idx);
+
+                bottom_line_video   = BinaryVideoProcessing.erase_bottom_line(filtered_roi_video, line_idx);
+                threshold_video     = GrayVideoConverter.apply_threshold(bottom_line_video);
+
+                [track_pt, coord_side] = LightSourceTracker.apply_tracker(threshold_video);
+                fprintf('[Info] Tracking-Koordinate: row=%d, col=%d\n', track_pt(:,1), track_pt(:,2));
+
+                track_pt = LightSourceTracker.smooth_tracking_points(track_pt, 3);
+
+                fprintf('[Info] (geglättet) Tracking-Koordinate: row=%d, col=%d\n', track_pt(:,1), track_pt(:,2));
+
+
+                [max_x, max_y] = LightSourceTracker.compute_max_coords(track_pt, coord_side);
+                fprintf('[Info] max_x = %d, max_y = %d\n', max_x, max_y);
+
+                light_source_video = GrayVideoConverter.cut_out_surface(lin_cropped_video, track_pt, 2*max_x, max_y);
+                disp('[OK] light_source_video fertig.');
+            end
+        end
+
+
+        function looped_vector = get_loop(vector, frames)
+            % Teile den Vektor in zwei Hälften
+            v2 = vector(1:end/2);           % Erster Vektor (erste Hälfte)
+            v1 = vector(end/2+1:end);       % Zweiter Vektor (zweite Hälfte)
+
+            % Anzahl der Frames für den Übergang
+            x = frames;  % Überlappungsbereich, hier übergeben als Parameter
+
+            % Länge der Vektoren
+            len_v1 = length(v1);
+            len_v2 = length(v2);
+
+            % Sinus-Fade-Parameter erstellen (von 0 bis pi für sanfte Überblendung)
+            t = linspace(0, pi, x);
+            fade_in = sin(t / 2);   % Fade-In (S-Kurve für den zweiten Vektor)
+            fade_out = cos(t / 2);  % Fade-Out (S-Kurve für den ersten Vektor)
+
+            % Teil 1: Bereich vor der Überblendung bleibt unverändert (Anfang von v1)
+            looped_vector = v1(1:(len_v1 - x));  % Bereich ohne Überblendung aus v1
+
+            % Teil 2: Überblendung über die x Frames (Sinus-Fade)
+            for i = 1:x
+                idx_v1 = (len_v1 - x) + i;   % Der Index für v1 in der Überblendungszone
+                idx_v2 = i;                  % Der Index für v2 in der Überblendungszone
+                looped_vector(end + 1) = fade_out(i) * v1(idx_v1) + fade_in(i) * v2(idx_v2);
+            end
+
+            % Teil 3: Füge den Rest von v2 nach der Überblendung an
+            looped_vector = [looped_vector, v2(x+1:end)];
+        end
+
+
+        function play_segmented_videos(segmented_video_1, segmented_video_2, segmented_video_3, segmented_video_4, FrameRate)
+            % Funktion zum Abspielen der vier Video-Segmente in einem geeigneten Plot
+            %
+            % Eingabe:
+            % segmented_video_1 - Struktur mit dem ersten Segment pro Frame
+            % segmented_video_2 - Struktur mit dem zweiten Segment pro Frame
+            % segmented_video_3 - Struktur mit dem dritten Segment pro Frame
+            % segmented_video_4 - Struktur mit dem vierten Segment pro Frame
+
+            num_frames = length(segmented_video_1);
+
+            figure;
+
+            for frame_idx = 1:num_frames
+                % Extrahiere die Segmente des aktuellen Frames
+                frame1 = segmented_video_1(frame_idx).gray;
+                frame2 = segmented_video_2(frame_idx).gray;
+                frame3 = segmented_video_3(frame_idx).gray;
+                frame4 = segmented_video_4(frame_idx).gray;
+
+                % Erstelle die Plot-Subplots für jedes Segment
+                subplot(2, 2, 1);
+                imshow(frame1);
+                title(sprintf('Segment 1 - Frame %d', frame_idx));
+
+                subplot(2, 2, 2);
+                imshow(frame2);
+                title(sprintf('Segment 2 - Frame %d', frame_idx));
+
+                subplot(2, 2, 3);
+                imshow(frame3);
+                title(sprintf('Segment 3 - Frame %d', frame_idx));
+
+                subplot(2, 2, 4);
+                imshow(frame4);
+                title(sprintf('Segment 4 - Frame %d', frame_idx));
+
+                pause(1/FrameRate);
+            end
+        end
+
+        function play_simulation_video(avg_values_1, avg_values_2, avg_values_3, avg_values_4, FrameRate)
+            % Funktion zum Abspielen und Exportieren eines Videos, das die Durchschnittswerte der Segmente für jedes Frame anzeigt
+            %
+            % Eingabe:
+            % avg_values_1 - Durchschnittswerte des ersten Segments
+            % avg_values_2 - Durchschnittswerte des zweiten Segments
+            % avg_values_3 - Durchschnittswerte des dritten Segments
+            % avg_values_4 - Durchschnittswerte des vierten Segments
+            % FrameRate - Abspielrate des Videos
+
+            num_frames = length(avg_values_1);
+
+            % Finden des maximalen Wertes aus allen Durchschnittswerten
+            normal_max = max([avg_values_1(:); avg_values_2(:); avg_values_3(:); avg_values_4(:)]);
+
+            % Normalisiere die Farben für die Segmente auf 255
+            colors_1 = uint8((avg_values_1' / normal_max) * 255);
+            colors_2 = uint8((avg_values_2' / normal_max) * 255);
+            colors_3 = uint8((avg_values_3' / normal_max) * 255);
+            colors_4 = uint8((avg_values_4' / normal_max) * 255);
+
+            % Erstelle eine schwarze Bildfläche im Format 16:9 mit zusätzlichem Platz für den Kerzenstiel
+            video_height = 1200; % Erhöhte Höhe für den Kerzenstiel
+            video_width = 700;
+            black_frame = zeros(video_height, video_width, 3, 'uint8');
+
+            % Definiere die Positionen und Größe der Quadrate
+            square_height = 100;
+            square_width = 15; % Schmalere Quadrate
+
+            % Berechne die Positionen relativ zur Mitte des Bildes
+            center_y = round(video_height / 3);
+            center_x = round(video_width / 2);
+
+            positions = [
+                center_y - square_height, center_x - square_width;          % Segment 1
+                center_y - square_height, center_x;                        % Segment 2
+                center_y, center_x - square_width;                         % Segment 3
+                center_y, center_x                                        % Segment 4
+                ];
+
+            % Position und Größe des Kerzenstiels
+            stem_height = 500;
+            stem_width = 100;
+            stem_y_start = center_y + square_height + 10; % Position unter den Segmenten
+            stem_x_start = center_x - (stem_width / 2);   % Zentriert unter den Segmenten
+
+            % Funktion zum Erzeugen eines warmen Weißtons
+            warm_white = @(intensity) uint8(cat(3, intensity * 1.0, intensity * 0.9, intensity * 0.7));
+
+            % Dunkelrote Farbe für den Kerzenstiel
+            dark_red = uint8([139, 0, 0]);
+
+            % Video Writer initialisieren
+            video_filename = 'simulation_video.mp4';
+
+            video_writer = VideoWriter(video_filename, 'MPEG-4');
+            video_writer.FrameRate = FrameRate;
+            open(video_writer);
+
+            figure;
+            hold on;
+
+            for frame_idx = 1:num_frames
+                % Erstelle die Farbframes für jedes Segment
+                frame = black_frame;
+                frame_1 = repmat(warm_white(colors_1(frame_idx)), [square_height, square_width, 1]);
+                frame_2 = repmat(warm_white(colors_2(frame_idx)), [square_height, square_width, 1]);
+                frame_3 = repmat(warm_white(colors_3(frame_idx)), [square_height, square_width, 1]);
+                frame_4 = repmat(warm_white(colors_4(frame_idx)), [square_height, square_width, 1]);
+
+                % Setze die Farbframes in das schwarze Bild ein
+                frame(positions(1,1):positions(1,1)+square_height-1, positions(1,2):positions(1,2)+square_width-1, :) = frame_1;
+                frame(positions(2,1):positions(2,1)+square_height-1, positions(2,2):positions(2,2)+square_width-1, :) = frame_2;
+                frame(positions(3,1):positions(3,1)+square_height-1, positions(3,2):positions(3,2)+square_width-1, :) = frame_3;
+                frame(positions(4,1):positions(4,1)+square_height-1, positions(4,2):positions(4,2)+square_width-1, :) = frame_4;
+
+                % Zeichne den Kerzenstiel
+                frame(stem_y_start:stem_y_start+stem_height-1, stem_x_start:stem_x_start+stem_width-1, :) = repmat(reshape(dark_red, 1, 1, 3), [stem_height, stem_width, 1]);
+
+                % Zeige das Bild an
+                imshow(frame);
+                title(sprintf('Frame %d', frame_idx));
+
+                % Füge den Frame zum Video hinzu
+                writeVideo(video_writer, frame);
+
+                pause(1/FrameRate);
+            end
+
+            hold off;
+            close(video_writer);
+
+            fprintf('Video exportiert als simulation_video.mp4%s\n', video_filename);
+
+        end
+
+        function plot_segment_averages_color(avg_values_1, avg_values_2, avg_values_3, avg_values_4)
+            % Funktion zum Plotten der Durchschnittswerte der Segmente für jedes Frame
+            % mit Farbanzeige von 0 (schwarz) bis 255 (weiß)
+            %
+            % Eingabe:
+            % avg_values_1 - Durchschnittswerte des ersten Segments
+            % avg_values_2 - Durchschnittswerte des zweiten Segments
+            % avg_values_3 - Durchschnittswerte des dritten Segments
+            % avg_values_4 - Durchschnittswerte des vierten Segments
+
+            num_frames = length(avg_values_1);
+            time = (0:num_frames-1) / 30;
+
+            figure;
+
+            % Plotten der Durchschnittswerte für jedes Segment
+            subplot(2, 2, 1);
+            plot(time, avg_values_1);
+            title('Average Values - Segment 1');
+            xlabel('Time (s)');
+            ylabel('Grayscale');
+
+            subplot(2, 2, 2);
+            plot(time, avg_values_2);
+            title('Average Values - Segment 2');
+            xlabel('Time (s)');
+            ylabel('Grayscale');
+
+            subplot(2, 2, 3);
+            plot(time, avg_values_3);
+            title('Average Values - Segment 3');
+            xlabel('Time (s)');
+            ylabel('Grayscale');
+
+            subplot(2, 2, 4);
+            plot(time, avg_values_4);
+            title('Average Values - Segment 4');
+            xlabel('Time (s)');
+            ylabel('Grayscale');
+
+        end
+
+        function [segmented_video_1, segmented_video_2, segmented_video_3, segmented_video_4] = segment_cropped_video(cropped_video)
+            % Funktion zum Unterteilen des Videos in vier gleichgroße Segmente
+            %
+            % Eingabe:
+            % cropped_video - Struktur mit Graustufen-Frames
+            %
+            % Ausgabe:
+            % segmented_video_1 - Struktur mit dem ersten Segment pro Frame
+            % segmented_video_2 - Struktur mit dem zweiten Segment pro Frame
+            % segmented_video_3 - Struktur mit dem dritten Segment pro Frame
+            % segmented_video_4 - Struktur mit dem vierten Segment pro Frame
+
+            num_frames = length(cropped_video);
+            segmented_video_1 = struct('gray', []);
+            segmented_video_2 = struct('gray', []);
+            segmented_video_3 = struct('gray', []);
+            segmented_video_4 = struct('gray', []);
+
+            for frame_idx = 1:num_frames
+                frame = cropped_video(frame_idx).gray;
+                [height, width] = size(frame);
+
+                % Berechne die Grenzen der Segmente
+                mid_x = round(width / 2);
+                mid_y = round(height / 2);
+
+                % Erstelle die vier Segmente
+                segment1 = frame(1:mid_y, 1:mid_x);
+                segment2 = frame(1:mid_y, mid_x+1:end);
+                segment3 = frame(mid_y+1:end, 1:mid_x);
+                segment4 = frame(mid_y+1:end, mid_x+1:end);
+
+                % Speichere die Segmente in den jeweiligen Strukturen
+                segmented_video_1(frame_idx).gray = segment1;
+                segmented_video_2(frame_idx).gray = segment2;
+                segmented_video_3(frame_idx).gray = segment3;
+                segmented_video_4(frame_idx).gray = segment4;
+            end
+        end
+
+        function newVid = apply_gray_crop_max(videoIn, threshold, border)
+            % APPLY_GRAY_CROP_MAX  Erzeugt aus einem VideoReader-Objekt ein temporär
+            % gespeichertes, gecroptes Video (+ optionalem schwarzen Rand) und liefert
+            % dafür ein neues VideoReader-Objekt zurück.
+            %
+            %   newVid = apply_gray_crop_max(videoIn, threshold, border)
+            %
+            % Eingabe
+            %   videoIn   – Original-Video (VideoReader-Objekt, RGB oder Graustufen)
+            %   threshold – Grauwert-Schwelle (0‒255); Pixel ≤ threshold werden ignoriert
+            %   border    – Anzahl Pixel schwarzen Rand um den Crop (0 = keiner)
+            %
+            % Rückgabe
+            %   newVid    – VideoReader-Objekt des neu angelegten, gecropten Videos
+            %
+            % Hinweis
+            %   • Das Original-Objekt videoIn bleibt zwar im Workspace erhalten, zeigt
+            %     aber weiterhin auf die alte Datei. Weist man den Rückgabewert
+            %     derselben Variablen zu, ist der „alte“ Handle unmittelbar
+            %     überschrieben:
+            %
+            %            video = apply_gray_crop_max(video , 20 , 30);
+            %
+            %   • Die temporäre Datei wird im Standard-Temp-Verzeichnis abgelegt
+            %     und von MATLAB automatisch gelöscht, sobald alle Handles darauf
+            %     geschlossen sind (Session-Ende oder delete(newVid)).
+
+            %---------------------------------------------------------------
+            % 1) Maximalbild bestimmen (stream-basiert, kein Puffern nötig)
+            %---------------------------------------------------------------
+            fprintf('[apply_gray_crop_max] Ermittele Maximalbild …\n');
+
+            videoIn.CurrentTime = 0;
+            maxImg = [];
+            while hasFrame(videoIn)
+                frame = readFrame(videoIn);
+                if size(frame,3) == 3
+                    g = rgb2gray(frame);
+                else
+                    g = frame;
+                end
+                if isempty(maxImg)
+                    maxImg = g;
+                else
+                    maxImg = max(maxImg, g);
+                end
+            end
+
+            %---------------------------------------------------------------
+            % 2) ROI-Grenzen aus Maximalbild
+            %---------------------------------------------------------------
+            mask  = maxImg > threshold;
+            rows  = find(any(mask, 2));
+            cols  = find(any(mask, 1));
+
+            if isempty(rows) || isempty(cols)
+                warning('Keine Pixel über Threshold – Originalvideo wird zurückgegeben.');
+                newVid = videoIn;  return;
+            end
+
+            top    = max(rows(1) - border, 1);
+            bottom = min(rows(end) + border, size(maxImg,1));
+            left   = max(cols(1) - border, 1);
+            right  = min(cols(end) + border, size(maxImg,2));
+
+            fprintf('  → ROI: left=%d right=%d top=%d bottom=%d (mit border=%d)\n', ...
+                left, right, top, bottom, border);
+
+            %---------------------------------------------------------------
+            % 3) Video erneut öffnen und gecropt abspeichern
+            %---------------------------------------------------------------
+            tmpFile = [tempname, '.avi'];
+            writer = VideoWriter(tmpFile, 'Motion JPEG AVI');
+            writer.FrameRate = videoIn.FrameRate;
+            open(writer);
+
+            videoIn.CurrentTime = 0;          % wieder von vorne
+            while hasFrame(videoIn)
+                frame = readFrame(videoIn);
+                croped = frame(top:bottom, left:right, :);
+                writeVideo(writer, croped);
+            end
+            close(writer);
+
+            %---------------------------------------------------------------
+            % 4) Neues VideoReader-Objekt zurückgeben
+            %---------------------------------------------------------------
+            newVid = VideoReader(tmpFile);
+            fprintf('  ✓ Gecroptes Video gespeichert (%s)\n', tmpFile);
+        end
+    end
+end

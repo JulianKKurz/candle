@@ -1,0 +1,232 @@
+classdef LightSourceTracker
+    methods(Static)
+        function [coord_bottom, coord_side] = apply_tracker(video)
+            % Funktion zur Verarbeitung des binarisierten Videos und Rückgabe der Koordinaten des
+            % untersten Punkts der weißen Fläche und der max
+            imalen Koordinaten (left, right, up, down)
+            %
+            % Eingabe:
+            % video - Struktur mit binarisierten Frames
+            %
+            % Ausgabe:
+            % coord_bottom - Nx2-Matrix mit den Koordinaten der Mitte der unteren weißen Pixel in jedem Frame
+            % coord_side - Nx4-Matrix mit den maximalen Koordinaten (left, right, up, down) für jedes Frame
+
+            % Initialisieren der Ausgabe-Koordinaten-Matrix
+            coord_bottom = [];
+            coord_side = [];
+
+            % Video Frame für Frame verarbeiten
+            for frame_idx = 1:length(video)
+                img_binary_threshold = video(frame_idx).gray;
+
+                % Initialisieren der Variable zur Speicherung der Pixelanzahl
+                bottom_x_coord = [];
+
+                % Von unten nach oben durch das Bild iterieren, um die untersten weißen Pixel zu finden
+                for row_idx = size(img_binary_threshold, 1):-1:1
+                    % Finden aller weißen Pixel (Wert = 255) in dieser Zeile
+                    white_pixels_in_row = find(img_binary_threshold(row_idx, :) == 255);
+
+                    if ~isempty(white_pixels_in_row)
+                        % Berechnung der Mitte der weißen Pixel in der Zeile
+                        if length(white_pixels_in_row) == 1
+                            x_bottom = white_pixels_in_row;  % Nur ein Pixel, direkte Position
+                        else
+                            x_bottom = mean(white_pixels_in_row);  % Mehrere Pixel, Mittelwert berechnen
+                        end
+                        y_bottom = row_idx;  % Die y-Koordinate bleibt die aktuelle Zeile
+                        break;  % Schleife beenden, da die unterste Zeile mit weißen Pixeln gefunden wurde
+                    end
+                end
+
+                % Falls keine weißen Pixel gefunden wurden, NaN setzen
+                if isempty(white_pixels_in_row)
+                    x_bottom = NaN;
+                    y_bottom = NaN;
+                end
+
+                % Maximale Koordinaten (left, right, up, down) finden
+                [rows, cols] = find(img_binary_threshold == 255);
+                if ~isempty(rows)
+                    x_left = min(cols);
+                    x_right = max(cols);
+                    y_up = min(rows);
+                    y_down = max(rows);
+                else
+                    x_left = NaN;
+                    x_right = NaN;
+                    y_up = NaN;
+                    y_down = NaN;
+                end
+
+                % Koordinaten des unteren Mittelpunkts speichern
+                coord_bottom = [coord_bottom; y_bottom, x_bottom];
+
+                % Maximale Koordinaten speichern
+                coord_side = [coord_side; x_left, x_right, y_up, y_down];
+            end
+        end
+
+        function [max_coord_x, max_coord_y] = compute_max_coords(tracking_point, coord_side)
+            % Berechnet die maximalen Abstände zwischen den Koordinaten
+            max_coord_x_left = max(abs(tracking_point(:, 2) - coord_side(:, 1)));
+            max_coord_x_right = max(abs(tracking_point(:, 2) - coord_side(:, 2)));
+            max_coord_x = max([max_coord_x_left, max_coord_x_right]);
+
+            max_coord_y_up = max(abs(tracking_point(:, 1) - coord_side(:, 3)));
+            max_coord_y_down = max(abs(tracking_point(:, 1) - coord_side(:, 4)));
+            max_coord_y = max([max_coord_y_up, max_coord_y_down]);
+        end
+
+        function summed_points_video = find_stable_point(contoured_video, num_frames_to_sum)
+            % Funktion zur Summierung der weißen Pixel über mehrere Frames
+            %
+            % Eingabe:
+            % contoured_video - Struktur mit Frames, bei denen nur die Kontur der ersten weißen Fläche bleibt
+            % num_frames_to_sum - Anzahl der Frames, über die die weißen Pixel summiert werden sollen
+            %
+            % Ausgabe:
+            % summed_points_video - Struktur mit Frames, bei denen die summierten weißen Pixel markiert sind
+
+            % Initialisieren der Ausgabevideo-Struktur
+            summed_points_video = struct('gray', cell(1, length(contoured_video) - num_frames_to_sum + 1));
+
+            % Video Frame für Frame verarbeiten
+            for frame_idx = 1:length(contoured_video) - num_frames_to_sum + 1
+                % Initialisieren eines leeren Bildes für die Summierung
+                summed_img = zeros(size(contoured_video(1).gray));
+
+                % Über die nächsten `num_frames_to_sum` Frames iterieren und die weißen Pixel summieren
+                for sum_idx = 0:num_frames_to_sum - 1
+                    img_contour = contoured_video(frame_idx + sum_idx).gray;
+                    summed_img = summed_img + img_contour;
+                end
+
+                % Summierten Frame speichern
+                summed_points_video(frame_idx).gray = summed_img;
+            end
+        end
+
+        function angle_rad = get_movement_direction(average_slow_coords, average_middle_coords)
+            % get_MovementDirection - Berechnet den Bewegungswinkel in Bogenmaß
+            %
+            % Syntax: angle_rad = get_MovementDirection(average_slow_coords, average_middle_coords)
+            %
+            % Eingaben:
+            %   average_slow_coords - Nx2 Matrix mit durchschnittlichen Koordinaten der langsamen Bewegung
+            %   average_middle_coords - Nx2 Matrix mit durchschnittlichen Koordinaten der mittleren Bewegung
+            %
+            % Ausgaben:
+            %   angle_rad - Der berechnete Bewegungswinkel in Bogenmaß (Rad)
+
+            % Anzahl der Frames (Annahme: beide Listen haben die gleiche Länge)
+            num_frames = size(average_slow_coords, 1);
+
+            % Initialisierung der Summen für x- und y-Differenzen
+            sum_x_diff = 0;
+            sum_y_diff = 0;
+
+            % Schleife über alle Frames, um die Differenzen zu summieren (NaN-Werte ignorieren)
+            for frame_idx = 1:num_frames
+                % Extrahiere die x- und y-Koordinaten für beide Listen
+                x_slow = average_slow_coords(frame_idx, 2);
+                y_slow = average_slow_coords(frame_idx, 1);
+                x_middle = average_middle_coords(frame_idx, 2);
+                y_middle = average_middle_coords(frame_idx, 1);
+
+                % Prüfen, ob einer der Werte NaN ist, um den Frame zu überspringen
+                if isnan(x_slow) || isnan(y_slow) || isnan(x_middle) || isnan(y_middle)
+                    continue;
+                end
+
+                % Berechne die Differenzen und addiere sie zu den Gesamtsummen
+                sum_x_diff = sum_x_diff + (x_slow - x_middle);
+                sum_y_diff = sum_y_diff + (y_slow - y_middle);
+            end
+
+            % Berechne die Gesamtlänge des resultierenden Differenzvektors
+            total_magnitude = sqrt(sum_x_diff^2 + sum_y_diff^2);
+
+            % Normiere die Summen, falls die Gesamtlänge größer als 0 ist
+            if total_magnitude > 0
+                norm_x_diff = sum_x_diff / total_magnitude;
+                norm_y_diff = sum_y_diff / total_magnitude;
+            else
+                norm_x_diff = 0;
+                norm_y_diff = 0;
+            end
+
+            % Berechne den Winkel des normierten Vektors in Bogenmaß (Rad)
+            angle_rad = atan2(-norm_x_diff, norm_y_diff);  % atan2(y, x)
+        end
+
+        function [interp_x, interp_y] = interpolate_coords(coord_bottom)
+            % Führt eine lineare Interpolation der Koordinaten des untersten Punkts durch
+            num_window = length(coord_bottom);
+            frame_indices = 1:num_window;
+            interp_x = interp1(frame_indices, coord_bottom(:, 1), frame_indices, 'linear');
+            interp_y = interp1(frame_indices, coord_bottom(:, 2), frame_indices, 'linear');
+        end
+
+        function smoothed_pts = smooth_tracking_points(track_pts, poly_order)
+            % Glättet eine Liste von Tracking-Punkten mittels polynomialer Approximation
+            % Eingabe:
+            %   track_pts   – Nx2 Matrix mit [row, col]
+            %   poly_order  – Grad des Polynoms (z.B. 3 für kubische Approximation)
+            % Ausgabe:
+            %   smoothed_pts – Nx2 Matrix mit geglätteten Punkten
+
+            n = size(track_pts, 1);
+            x = (1:n)';  % Zeit-/Frame-Achse
+
+            rows = track_pts(:,1);
+            cols = track_pts(:,2);
+
+            % Polynome anpassen
+            p_row = polyfit(x, rows, poly_order);
+            p_col = polyfit(x, cols, poly_order);
+
+            % Polynome auswerten
+            smooth_rows = polyval(p_row, x);
+            smooth_cols = polyval(p_col, x);
+
+            smoothed_pts = [round(smooth_rows), round(smooth_cols)];
+        end
+
+        function angle_rad = process_and_rotate_video(filtered_roi_video, FrameRate)
+
+            % Skalieren des Graustufen-Videos
+            scaled_video = GrayVideoConverter.scaleGrayVideo(filtered_roi_video, FrameRate);
+            disp("Video wurde erfolgreich skaliert!")
+
+            % Durchschnittskoordinaten berechnen
+            average_middle_coords = GrayVideoAnalyzer.get_average_coord(scaled_video);
+
+            % Form auf Video anwenden
+            shaped_video = BinaryVideoProcessing.apply_shape(scaled_video);
+
+            % Werte für die optimale Fenstergröße berechnen
+            values = [];
+            for window = 1:length(shaped_video)
+                binary_average_video = BinaryVideoProcessing.apply_binary_average(shaped_video, window);
+                quantity = GrayVideoAnalyzer.count_pixels(binary_average_video, 1);
+                values = [values mean(abs(diff(quantity)))];
+            end
+
+            % Fenstergröße mit minimalem Wert finden
+            window = find(values == min(values), 1);
+            disp("window")
+            disp(window)
+
+            % Binäres Durchschnitts-Video mit dem optimalen Fenster erstellen
+            binary_average_video = BinaryVideoProcessing.apply_binary_average(shaped_video, window);
+
+            % Durchschnittliche langsame Koordinaten berechnen
+            average_slow_coords = GrayVideoAnalyzer.get_average_coord(binary_average_video);
+
+            % Bewegungsrichtung in Radiant bestimmen
+            angle_rad = LightSourceTracker.get_movement_direction(average_slow_coords, average_middle_coords);
+        end
+    end
+end
